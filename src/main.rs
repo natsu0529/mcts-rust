@@ -1,4 +1,4 @@
-use mcts_chess::board::{Color, Position, START_FEN};
+use mcts_chess::board::{Color, Move, Position, START_FEN};
 use mcts_chess::mcts::{flat_mc, rollout_with_len, uct, Config, SearchResult};
 use mcts_chess::movegen::GameResult;
 use mcts_chess::rng::Rng;
@@ -10,6 +10,8 @@ const USAGE: &str = "使い方:
   mcts_chess best <iters> [flat] [fen]      最善手を探索して表示（既定は UCT）
   mcts_chess vs-random <games> <iters>      UCT 対 ランダムプレイヤーの対局
   mcts_chess vs-flat <games> <iters>        UCT 対 Flat MC の対局
+  mcts_chess vs-self <games> <iters A> <threads A> <iters B> <threads B>
+                                            UCT 同士（設定違い）の対局
   mcts_chess play <iters>                   人間(白) 対 UCT(黒)。手は e2e4 形式";
 
 fn main() {
@@ -19,6 +21,7 @@ fn main() {
         Some("best") => cmd_best(&args[1..]),
         Some("vs-random") => cmd_vs(&args[1..], false),
         Some("vs-flat") => cmd_vs(&args[1..], true),
+        Some("vs-self") => cmd_vs_self(&args[1..]),
         Some("play") => cmd_play(&args[1..]),
         Some("bench") => cmd_bench(&args[1..]),
         _ => println!("{USAGE}"),
@@ -100,23 +103,25 @@ fn cmd_best(args: &[String]) {
     print_result(&pos, &r, t.elapsed().as_secs_f64(), iters);
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy)]
 enum Player {
-    Uct,
-    Flat,
+    Uct(Config),
+    Flat(Config),
     Random,
 }
 
-fn choose(p: Player, pos: &Position, cfg: &Config, rng: &mut Rng) -> Option<mcts_chess::board::Move> {
-    match p {
-        Player::Uct => uct(pos, cfg, rng).best,
-        Player::Flat => flat_mc(pos, cfg, rng).best,
-        Player::Random => pos.random_legal_move(rng),
+impl Player {
+    fn choose(&self, pos: &Position, rng: &mut Rng) -> Option<Move> {
+        match self {
+            Player::Uct(cfg) => uct(pos, cfg, rng).best,
+            Player::Flat(cfg) => flat_mc(pos, cfg, rng).best,
+            Player::Random => pos.random_legal_move(rng),
+        }
     }
 }
 
 /// 1 局指して結果を返す。千日手（3 回）と 300 手打ち切りは引き分け。
-fn play_game(white: Player, black: Player, cfg: &Config, rng: &mut Rng) -> GameResult {
+fn play_game(white: &Player, black: &Player, rng: &mut Rng) -> GameResult {
     let mut pos = Position::from_fen(START_FEN).unwrap();
     let mut history = vec![pos];
     for _ in 0..300 {
@@ -127,32 +132,67 @@ fn play_game(white: Player, black: Player, cfg: &Config, rng: &mut Rng) -> GameR
             return GameResult::Draw;
         }
         let player = if pos.side == Color::White { white } else { black };
-        let Some(m) = choose(player, &pos, cfg, rng) else { return GameResult::Draw };
+        let Some(m) = player.choose(&pos, rng) else { return GameResult::Draw };
         pos = pos.make_move(m);
         history.push(pos);
     }
     GameResult::Draw
 }
 
-fn cmd_vs(args: &[String], vs_flat: bool) {
-    let games: u32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(10);
-    let iters: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10_000);
-    let cfg = Config { iterations: iters, ..Config::default() };
-    let opponent = if vs_flat { Player::Flat } else { Player::Random };
+/// A と B を先後交互に games 局対局させ、A から見た勝敗を表示する。
+fn run_match(name_a: &str, a: Player, name_b: &str, b: Player, games: u32) {
     let mut rng = Rng::from_time();
     let (mut w, mut d, mut l) = (0, 0, 0);
     for g in 0..games {
-        let uct_white = g % 2 == 0;
-        let (white, black) = if uct_white { (Player::Uct, opponent) } else { (opponent, Player::Uct) };
-        let r = play_game(white, black, &cfg, &mut rng);
-        let uct_won = matches!((r, uct_white), (GameResult::WhiteWins, true) | (GameResult::BlackWins, false));
-        let uct_lost = matches!((r, uct_white), (GameResult::WhiteWins, false) | (GameResult::BlackWins, true));
-        if uct_won { w += 1 } else if uct_lost { l += 1 } else { d += 1 }
-        println!("game {:3}: UCT={} -> {}", g + 1, if uct_white { "White" } else { "Black" },
-            if uct_won { "UCT win" } else if uct_lost { "UCT loss" } else { "draw" });
+        let a_white = g % 2 == 0;
+        let r = if a_white { play_game(&a, &b, &mut rng) } else { play_game(&b, &a, &mut rng) };
+        let a_score = if a_white { r.white_score() } else { 1.0 - r.white_score() };
+        let label = if a_score == 1.0 {
+            w += 1;
+            "A win"
+        } else if a_score == 0.0 {
+            l += 1;
+            "A loss"
+        } else {
+            d += 1;
+            "draw"
+        };
+        println!("game {:3}: A={} -> {label}", g + 1, if a_white { "White" } else { "Black" });
         io::stdout().flush().ok();
     }
-    println!("UCT {iters} playouts vs {}: +{w} ={d} -{l}", if vs_flat { "Flat MC" } else { "Random" });
+    let score = (w as f64 + 0.5 * d as f64) / games as f64;
+    println!("A: {name_a}\nB: {name_b}\nA の成績: +{w} ={d} -{l}  得点率 {:.1}%", score * 100.0);
+}
+
+fn arg<T: std::str::FromStr>(args: &[String], i: usize, default: T) -> T {
+    args.get(i).and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+/// UCT（1 スレッド）対 ランダム / Flat MC
+fn cmd_vs(args: &[String], vs_flat: bool) {
+    let games: u32 = arg(args, 0, 10);
+    let iters: u32 = arg(args, 1, 10_000);
+    let cfg = Config { iterations: iters, threads: 1, ..Config::default() };
+    let (name_b, b) = if vs_flat { ("Flat MC", Player::Flat(cfg)) } else { ("Random", Player::Random) };
+    run_match(&format!("UCT {iters} playouts"), Player::Uct(cfg), name_b, b, games);
+}
+
+/// UCT 同士で、プレイアウト数とスレッド数を変えて対局させる。
+fn cmd_vs_self(args: &[String]) {
+    let games: u32 = arg(args, 0, 10);
+    let ia: u32 = arg(args, 1, 20_000);
+    let ta: usize = arg(args, 2, 1);
+    let ib: u32 = arg(args, 3, 2_000);
+    let tb: usize = arg(args, 4, 1);
+    let a = Config { iterations: ia, threads: ta, ..Config::default() };
+    let b = Config { iterations: ib, threads: tb, ..Config::default() };
+    run_match(
+        &format!("UCT {ia} playouts / {ta} threads"),
+        Player::Uct(a),
+        &format!("UCT {ib} playouts / {tb} threads"),
+        Player::Uct(b),
+        games,
+    );
 }
 
 fn cmd_play(args: &[String]) {

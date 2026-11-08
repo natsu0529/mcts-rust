@@ -14,11 +14,18 @@ pub struct Config {
     pub c: f64,
     /// プレイアウトの最大手数。超えたら引き分け扱い。
     pub max_rollout_plies: u32,
+    /// 探索スレッド数（ルート並列化）。iterations は全スレッドの合計。
+    pub threads: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { iterations: 100_000, c: 1.0, max_rollout_plies: 300 }
+        Config {
+            iterations: 100_000,
+            c: 1.0,
+            max_rollout_plies: 300,
+            threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        }
     }
 }
 
@@ -132,8 +139,47 @@ impl Node {
     }
 }
 
-/// UCT: 選択（UCB1）→ 展開 → ランダムプレイアウト → 逆伝播。
+/// UCT。`cfg.threads` が 2 以上ならルート並列化する:
+/// スレッドごとに独立した木で探索し、ルートの各手の訪問数と勝ち点を合算する。
 pub fn uct(root: &Position, cfg: &Config, rng: &mut Rng) -> SearchResult {
+    let threads = cfg.threads.max(1);
+    if threads == 1 {
+        return uct_single(root, cfg, rng);
+    }
+    let per_thread = Config { iterations: cfg.iterations.div_ceil(threads as u32), ..*cfg };
+    let seeds: Vec<u64> = (0..threads).map(|_| rng.next_u64()).collect();
+    let results: Vec<SearchResult> = std::thread::scope(|s| {
+        let handles: Vec<_> = seeds
+            .iter()
+            .map(|&seed| s.spawn(move || uct_single(root, &per_thread, &mut Rng::new(seed))))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // 手ごとに (訪問数, 勝ち点) を合算する
+    let mut merged: Vec<(Move, u32, f64)> = Vec::new();
+    for r in &results {
+        for st in &r.stats {
+            let wins = st.win_rate * st.visits as f64;
+            match merged.iter_mut().find(|(m, _, _)| *m == st.mv) {
+                Some(e) => {
+                    e.1 += st.visits;
+                    e.2 += wins;
+                }
+                None => merged.push((st.mv, st.visits, wins)),
+            }
+        }
+    }
+    let mut stats: Vec<MoveStat> = merged
+        .into_iter()
+        .map(|(mv, visits, wins)| MoveStat { mv, visits, win_rate: wins / visits.max(1) as f64 })
+        .collect();
+    stats.sort_by(|a, b| b.visits.cmp(&a.visits));
+    SearchResult { best: stats.first().map(|s| s.mv), stats }
+}
+
+/// 1 スレッドの UCT: 選択（UCB1）→ 展開 → ランダムプレイアウト → 逆伝播。
+pub fn uct_single(root: &Position, cfg: &Config, rng: &mut Rng) -> SearchResult {
     let mut nodes = vec![Node::new(*root, None, None)];
     if nodes[0].terminal.is_some() {
         return SearchResult { best: None, stats: vec![] };
